@@ -76,8 +76,41 @@ SQLite에는 다음 데이터가 들어갑니다.
 - runs
 - usage_events
 - checkpoints
+- memories
+- automations
 
-### 5. LangGraph 적용 방향
+### 5. MCP Bridge
+
+외부 CLI/에이전트가 오케스트라 상태를 읽을 수 있도록 MCP JSON-RPC Bridge를 제공합니다.
+
+기본 주소는 앱 설정 화면에서 확인할 수 있습니다.
+
+```text
+http://127.0.0.1:8765/<secret-path>
+```
+
+지원 메서드:
+
+| MCP 메서드 | 역할 |
+|---|---|
+| `initialize` | MCP 클라이언트 연결 초기화 |
+| `tools/list` | 오케스트라가 제공하는 도구 목록 조회 |
+| `tools/call` | 프로젝트/메모리/실행기록/사용량 조회 도구 실행 |
+| `ping` | 연결 상태 확인 |
+
+제공 도구:
+
+| 도구 | 역할 |
+|---|---|
+| `list_projects` | 프로젝트 목록 조회 |
+| `get_project` | 특정 프로젝트의 최근 메시지, 작업, 승인 대기 항목 조회 |
+| `search_memory` | 프로젝트 대화/작업/장기 메모리 검색 |
+| `list_runs` | 에이전트 실행 기록 조회 |
+| `usage_summary` | 모델별 토큰 사용량과 로컬 LLM 절감 추정치 조회 |
+
+현재 Bridge는 안전을 위해 읽기 도구 중심으로 열려 있습니다. 파일 수정, 명령 실행 같은 쓰기 도구는 Permission Gate와 묶은 뒤 별도 확장합니다.
+
+### 6. LangGraph 적용 방향
 
 LangGraph는 화면에 직접 드러나는 기능이 아니라 내부 실행 엔진 역할로 적용합니다.
 
@@ -199,7 +232,7 @@ ollama pull qwen2.5-coder:7b
 - 취소 시 partial 저장
 - Router 결과 JSON 검증/로컬 재시도
 - CLI 인증 파일 기반 로그인 상태 보강
-- MCP Bridge 기본 서버
+- MCP Bridge JSON-RPC 서버
 - 매일 오전 미완료 작업 요약 루틴
 - 탐색 위임 격리 원칙
 - 프로젝트별 장기 메모리 검색
@@ -208,6 +241,6 @@ ollama pull qwen2.5-coder:7b
 ## 앞으로 보강할 부분
 
 - 모델별 실제 usage API가 제공될 경우 추정값 대신 실제값 저장 범위 확대
-- MCP Bridge를 표준 MCP 프로토콜 서버로 확장
+- MCP Bridge 쓰기 도구를 Permission Gate와 연결
 - LangGraph Python 공식 패키지와의 호환 Checkpointer 추가
 - Permission Gate 세부 정책 UI 추가

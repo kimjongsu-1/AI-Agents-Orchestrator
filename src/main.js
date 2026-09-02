@@ -8,6 +8,7 @@ const providers = require("./providers/provider_adapters");
 const { ConsoleGraphRuntime } = require("./engine/langgraph_runtime");
 const permissionGate = require("./security/permission_gate");
 const { parseActualUsage } = require("./usage/usage_parser");
+const { startMcpBridge: createMcpBridgeServer } = require("./mcp/mcp_bridge");
 
 app.setName("AI 오케스트레이터");
 
@@ -731,54 +732,15 @@ async function probeAgent(command, probeCommand, timeout = 25000) {
 }
 
 function startMcpBridge() {
-  const state = readState();
-  if (!state.mcpBridge?.enabled || mcpBridgeServer) return;
-  const secretPath = state.mcpBridge.secretPath || `/mcp-${uid("secret")}`;
-  state.mcpBridge.secretPath = secretPath;
-  writeState(state);
-
-  mcpBridgeServer = http.createServer((req, res) => {
-    const current = readState();
-    const port = current.mcpBridge?.port || 8765;
-    const url = new URL(req.url, `http://127.0.0.1:${port}`);
-    if (!url.pathname.startsWith(secretPath)) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "not_found" }));
-      return;
+  if (mcpBridgeServer) return;
+  mcpBridgeServer = createMcpBridgeServer({
+    readState,
+    writeState,
+    uid,
+    onError: () => {
+      mcpBridgeServer = null;
     }
-
-    const route = url.pathname.slice(secretPath.length) || "/";
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    if (route === "/" || route === "/health") {
-      res.end(JSON.stringify({ ok: true, name: "AI Orchestrator MCP Bridge", version: current.version }));
-      return;
-    }
-    if (route === "/tools") {
-      res.end(JSON.stringify({
-        ok: true,
-        tools: [
-          { name: "search_memory", description: "프로젝트 대화/메모리 검색" },
-          { name: "list_projects", description: "프로젝트 목록 조회" },
-          { name: "usage_summary", description: "모델별 사용량 요약" }
-        ]
-      }));
-      return;
-    }
-    if (route === "/projects") {
-      res.end(JSON.stringify({ ok: true, projects: current.projects.map((p) => ({ id: p.id, title: p.title, status: p.status })) }));
-      return;
-    }
-    if (route === "/usage") {
-      res.end(JSON.stringify({ ok: true, usageEvents: current.usageEvents.slice(0, 100) }));
-      return;
-    }
-    res.end(JSON.stringify({ ok: false, error: "unknown_route" }));
   });
-
-  mcpBridgeServer.on("error", () => {
-    mcpBridgeServer = null;
-  });
-  mcpBridgeServer.listen(state.mcpBridge.port, "127.0.0.1");
 }
 
 function startAutomationScheduler() {
