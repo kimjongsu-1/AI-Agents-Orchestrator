@@ -270,12 +270,14 @@ function renderEvals(project) {
 function renderRuns(project) {
   const runs = (appState.runs || []).filter((run) => run.projectId === project.id);
   const running = runs.filter((run) => run.state === "실행 중" || run.state === "대기").length;
+  const approval = runs.filter((run) => run.state === "승인 대기").length;
   const failed = runs.filter((run) => run.state === "실패").length;
   const done = runs.filter((run) => run.state === "완료").length;
   els.runsView.innerHTML = runs.length
     ? `
         <section class="run-status-summary">
           <div><span>진행 중</span><strong>${running}</strong></div>
+          <div><span>승인 대기</span><strong>${approval}</strong></div>
           <div><span>완료</span><strong>${done}</strong></div>
           <div><span>실패</span><strong>${failed}</strong></div>
         </section>
@@ -284,7 +286,7 @@ function renderRuns(project) {
           <article class="run-card" data-run-id="${escapeHtml(run.id)}">
             <div>
               <b>${escapeHtml(agentLabels[run.agentId] || run.agentId)}</b>
-              <span>${escapeHtml(run.state)} · ${formatTime(run.createdAt)}</span>
+              <span>${escapeHtml(run.state)}${run.partial ? " · partial" : ""} · ${formatTime(run.createdAt)}</span>
             </div>
             <p>${escapeHtml(run.instruction || "현재 프로젝트 검토")}</p>
             <small>${escapeHtml(run.promptFile || "")}</small>
@@ -467,6 +469,7 @@ function renderCompare(project) {
 function renderSettings(project) {
   const routerAgent = project.routerAgent || appState.settings?.routerAgent || "codex";
   const localRouterModel = project.localRouterModel || appState.settings?.localRouterModel || "qwen2.5-coder:7b";
+  const mcp = appState.mcpBridge || {};
   els.settingsView.innerHTML = `
     <section class="settings-card">
       <h2>프로젝트 설정</h2>
@@ -483,6 +486,11 @@ function renderSettings(project) {
       </label>
       <label>Ollama Router 모델<input id="settings-local-router-model" value="${escapeHtml(localRouterModel)}" placeholder="예: qwen2.5-coder:7b" /></label>
       <p class="settings-hint">Router/요약/분류는 로컬 LLM으로 처리해 외부 API 토큰 비용을 줄입니다. 실제 Codex/Claude 작업 사용량은 별도로 추적합니다.</p>
+      <div class="settings-info-box">
+        <b>LangGraph / MCP / 자동화</b>
+        <p>작업 흐름은 LangGraph식 체크포인트로 저장됩니다. MCP Bridge: 127.0.0.1:${escapeHtml(mcp.port || "8765")}${escapeHtml(mcp.secretPath || "/mcp-*")}</p>
+        <p>매일 오전 ${escapeHtml(appState.settings?.dailyRoutineHour || 9)}시에 미완료 작업 요약 루틴이 실행됩니다.</p>
+      </div>
       <div class="settings-actions">
         <button data-save-project-settings>설정 저장</button>
         <button data-check-git-status>Git 상태 확인</button>

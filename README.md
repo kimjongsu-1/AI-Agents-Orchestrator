@@ -191,13 +191,23 @@ ollama pull qwen2.5-coder:7b
 - 출력 필터링
 - 사용량 탭
 - JSON 저장 + SQLite 동기화
+- LangGraph식 실행 그래프/체크포인트 저장 구조
+- Provider Adapter 파일 분리
+- Tool Permission Gate 승인/거절/수정 요청 흐름
+- 부분 응답 저장
+- 요청 ID 기반 중복 스트림 방지
+- 취소 시 partial 저장
+- Router 결과 JSON 검증/로컬 재시도
+- CLI 인증 파일 기반 로그인 상태 보강
+- MCP Bridge 기본 서버
+- 매일 오전 미완료 작업 요약 루틴
+- 탐색 위임 격리 원칙
+- 프로젝트별 장기 메모리 검색
 - 토큰 절감용 AGENTS.md / wrapper scripts
 
 ## 앞으로 보강할 부분
 
-- Provider Adapter 파일 분리
-- LangGraph 실제 Python/JS 엔진 연동
-- Tool Permission Gate UI 강화
-- 부분 응답 저장과 요청 ID 기반 중복 스트림 방지
-- 모델별 실제 usage API가 제공될 경우 추정값 대신 실제값 저장
-- MCP Bridge로 내부 도구를 외부 CLI에 주입
+- 모델별 실제 usage API가 제공될 경우 추정값 대신 실제값 저장 범위 확대
+- MCP Bridge를 표준 MCP 프로토콜 서버로 확장
+- LangGraph Python 공식 패키지와의 호환 Checkpointer 추가
+- Permission Gate 세부 정책 UI 추가

@@ -95,6 +95,25 @@ def init_db(conn: sqlite3.Connection) -> None:
             metadata_json TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            type TEXT,
+            text TEXT,
+            tags_json TEXT,
+            created_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS automations (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            name TEXT,
+            schedule TEXT,
+            enabled INTEGER DEFAULT 1,
+            last_run_at TEXT,
+            created_at TEXT
+        );
         """
     )
 
@@ -107,6 +126,8 @@ def sync(json_path: Path, db_path: Path) -> None:
         init_db(conn)
         with conn:
             conn.execute("DELETE FROM checkpoints")
+            conn.execute("DELETE FROM memories")
+            conn.execute("DELETE FROM automations")
             for project in data.get("projects", []):
                 conn.execute(
                     """
@@ -235,6 +256,39 @@ def sync(json_path: Path, db_path: Path) -> None:
                         json.dumps(checkpoint.get("state") or {}, ensure_ascii=False),
                         json.dumps(checkpoint.get("metadata") or {}, ensure_ascii=False),
                         checkpoint.get("createdAt"),
+                    ),
+                )
+
+            for memory in data.get("memories", []):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO memories(id, project_id, type, text, tags_json, created_at)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        memory.get("id"),
+                        memory.get("projectId"),
+                        memory.get("type"),
+                        memory.get("text"),
+                        json.dumps(memory.get("tags") or [], ensure_ascii=False),
+                        memory.get("createdAt"),
+                    ),
+                )
+
+            for automation in data.get("automations", []):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO automations(id, project_id, name, schedule, enabled, last_run_at, created_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        automation.get("id"),
+                        automation.get("projectId"),
+                        automation.get("name"),
+                        automation.get("schedule"),
+                        1 if automation.get("enabled", True) else 0,
+                        automation.get("lastRunAt"),
+                        automation.get("createdAt"),
                     ),
                 )
     finally:

@@ -4,6 +4,10 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const providers = require("./providers/provider_adapters");
+const { ConsoleGraphRuntime } = require("./engine/langgraph_runtime");
+const permissionGate = require("./security/permission_gate");
+const { parseActualUsage } = require("./usage/usage_parser");
 
 app.setName("AI 오케스트레이터");
 
@@ -23,7 +27,10 @@ const DEFAULT_STATE = {
     localRouterModel: "qwen2.5-coder:7b",
     enablePreScope: true,
     enableOutputFiltering: true,
-    enableUsageTracking: true
+    enableUsageTracking: true,
+    requireApprovalForRiskyRuns: true,
+    enableDailyRoutine: true,
+    dailyRoutineHour: 9
   },
   projects: [
     {
@@ -93,10 +100,20 @@ const DEFAULT_STATE = {
   runs: [],
   usageEvents: [],
   checkpoints: [],
+  memories: [],
+  automations: [],
+  mcpBridge: {
+    enabled: true,
+    port: 8765,
+    secretPath: ""
+  },
   finalDrafts: []
 };
 
 const runningProcesses = new Map();
+const activeRunRequests = new Map();
+let mcpBridgeServer = null;
+let lastDailyRoutineKey = null;
 
 function ensureDataFile() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -127,6 +144,12 @@ function migrateState(state) {
   state.runs = state.runs || [];
   state.usageEvents = state.usageEvents || [];
   state.checkpoints = state.checkpoints || [];
+  state.memories = state.memories || [];
+  state.automations = state.automations || [];
+  state.mcpBridge = {
+    ...DEFAULT_STATE.mcpBridge,
+    ...(state.mcpBridge || {})
+  };
   state.finalDrafts = state.finalDrafts || [];
   state.projects.forEach((project) => {
     project.messages = project.messages || [];
@@ -243,6 +266,65 @@ function recordCheckpoint(state, projectId, nodeName, graphState, metadata = {})
     createdAt: now()
   });
   state.checkpoints = state.checkpoints.slice(0, 500);
+}
+
+function rememberProjectEvent(state, projectId, type, text, tags = []) {
+  state.memories = state.memories || [];
+  const clean = compactText(text, 1800);
+  if (!clean) return null;
+  const item = {
+    id: uid("mem"),
+    projectId,
+    type,
+    text: clean,
+    tags,
+    createdAt: now()
+  };
+  state.memories.unshift(item);
+  state.memories = state.memories.slice(0, 1000);
+  return item;
+}
+
+function createRoutingGraph(project, message) {
+  return new ConsoleGraphRuntime({
+    checkpoint: (nodeName, graphState, metadata) => {
+      const state = readState();
+      recordCheckpoint(state, project.id, `LangGraph:${nodeName}`, graphState, metadata);
+      writeState(state);
+    }
+  })
+    .addNode("요청분석", async (graphState) => ({
+      state: {
+        projection: buildContextProjection(project, message.text || ""),
+        requestId: graphState.requestId || uid("route")
+      }
+    }))
+    .addNode("작업분배", async (graphState) => {
+      const routing = await plannedRunsFromMessage(project, message.text || "");
+      return {
+        state: {
+          routing,
+          plannedRunCount: routing.runs.length
+        }
+      };
+    })
+    .addEdge("요청분석", "작업분배");
+}
+
+function addApprovalForRun(state, project, run, reason) {
+  const approval = {
+    id: uid("approval"),
+    runId: run.id,
+    title: `${agentLabelsForMain(run.agentId)} 실행 승인 필요`,
+    detail: reason || "실행 전 사용자 승인이 필요합니다.",
+    state: "대기",
+    createdAt: now()
+  };
+  project.approvals.push(approval);
+  run.state = "승인 대기";
+  const task = project.tasks.find((item) => item.runId === run.id);
+  if (task) task.state = "승인 대기";
+  return approval;
 }
 
 function findProject(state, projectId) {
@@ -557,7 +639,11 @@ function classifyProbe(command, versionResult, probe) {
     };
   }
   if (
+    command === "ollama" && lower.includes("name") ||
     lower.includes("logged in using chatgpt") ||
+    lower.includes("authenticated") ||
+    lower.includes("auth status: logged in") ||
+    lower.includes("login status: logged in") ||
     lower.includes("you are logged in with grok.com") ||
     lower.includes("no installation issues found") ||
     lower.includes("claude code doctor")
@@ -628,7 +714,104 @@ async function probeAgent(command, probeCommand, timeout = 25000) {
   const version = await commandExists(command);
   if (!version.installed) return classifyProbe(command, version, null);
   const probe = await runProbe(command, probeCommand, timeout);
-  return classifyProbe(command, version, probe);
+  const classified = classifyProbe(command, version, probe);
+  if (!classified.ready) {
+    const home = os.homedir();
+    if (command === "codex" && fs.existsSync(path.join(home, ".codex", "auth.json"))) {
+      return { ...classified, ready: true, status: "ready-auth-file", message: "인증 파일 확인됨" };
+    }
+    if (command === "claude" && (fs.existsSync(path.join(home, ".claude", ".credentials.json")) || fs.existsSync(path.join(home, ".claude.json")))) {
+      return { ...classified, ready: true, status: "ready-auth-file", message: "인증 파일 확인됨" };
+    }
+    if (command === "grok" && fs.existsSync(path.join(home, ".grok"))) {
+      return { ...classified, status: "login-check-needed", message: "설정 폴더 확인됨 · CLI 상태 재확인 필요" };
+    }
+  }
+  return classified;
+}
+
+function startMcpBridge() {
+  const state = readState();
+  if (!state.mcpBridge?.enabled || mcpBridgeServer) return;
+  const secretPath = state.mcpBridge.secretPath || `/mcp-${uid("secret")}`;
+  state.mcpBridge.secretPath = secretPath;
+  writeState(state);
+
+  mcpBridgeServer = http.createServer((req, res) => {
+    const current = readState();
+    const port = current.mcpBridge?.port || 8765;
+    const url = new URL(req.url, `http://127.0.0.1:${port}`);
+    if (!url.pathname.startsWith(secretPath)) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "not_found" }));
+      return;
+    }
+
+    const route = url.pathname.slice(secretPath.length) || "/";
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    if (route === "/" || route === "/health") {
+      res.end(JSON.stringify({ ok: true, name: "AI Orchestrator MCP Bridge", version: current.version }));
+      return;
+    }
+    if (route === "/tools") {
+      res.end(JSON.stringify({
+        ok: true,
+        tools: [
+          { name: "search_memory", description: "프로젝트 대화/메모리 검색" },
+          { name: "list_projects", description: "프로젝트 목록 조회" },
+          { name: "usage_summary", description: "모델별 사용량 요약" }
+        ]
+      }));
+      return;
+    }
+    if (route === "/projects") {
+      res.end(JSON.stringify({ ok: true, projects: current.projects.map((p) => ({ id: p.id, title: p.title, status: p.status })) }));
+      return;
+    }
+    if (route === "/usage") {
+      res.end(JSON.stringify({ ok: true, usageEvents: current.usageEvents.slice(0, 100) }));
+      return;
+    }
+    res.end(JSON.stringify({ ok: false, error: "unknown_route" }));
+  });
+
+  mcpBridgeServer.on("error", () => {
+    mcpBridgeServer = null;
+  });
+  mcpBridgeServer.listen(state.mcpBridge.port, "127.0.0.1");
+}
+
+function startAutomationScheduler() {
+  setInterval(runDueAutomations, 60 * 1000);
+  setTimeout(runDueAutomations, 3000);
+}
+
+function runDueAutomations() {
+  const state = readState();
+  if (!state.settings?.enableDailyRoutine) return;
+  const date = new Date();
+  const hour = Number(state.settings.dailyRoutineHour || 9);
+  const key = `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}-${hour}`;
+  if (date.getHours() !== hour || lastDailyRoutineKey === key) return;
+  lastDailyRoutineKey = key;
+
+  state.projects.forEach((project) => {
+    const openTasks = (project.tasks || []).filter((task) => !["완료", "거절", "중단"].includes(task.state));
+    if (!openTasks.length) return;
+    appendProjectMessage(state, project, {
+      role: "assistant",
+      author: "Routine",
+      text: [
+        "매일 오전 미완료 작업 요약입니다.",
+        "",
+        ...openTasks.slice(0, 8).map((task, index) => `${index + 1}. [${task.state}] ${task.name} — ${task.detail}`)
+      ].join("\n")
+    });
+    recordCheckpoint(state, project.id, "Automation:미완료요약", {
+      openTaskCount: openTasks.length
+    });
+  });
+  writeState(state);
 }
 
 function createWindow() {
@@ -654,6 +837,8 @@ function createWindow() {
 
 app.whenReady().then(() => {
   createWindow();
+  startMcpBridge();
+  startAutomationScheduler();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -669,29 +854,14 @@ function quoteForAppleScript(value) {
 }
 
 function terminalCommandForAgent(agentId) {
-  const cwd = "/Users/h2o/Documents/AgentMuitle";
-  const commands = {
-    codex: "codex login",
-    claude: "claude",
-    grok: "if command -v grok >/dev/null 2>&1; then grok login --oauth || grok login || grok; else echo 'Grok CLI가 아직 설정되어 있지 않습니다.'; fi",
-    ollama: "ollama list; echo 'Ollama는 로컬 라우터로 사용됩니다. 필요한 모델이 없으면 ollama pull qwen2.5-coder:7b 를 실행하세요.'"
-  };
-  const command = commands[agentId];
-
-  if (!command) return null;
-  return `cd ${JSON.stringify(cwd)}; ${command}; exec $SHELL -l`;
+  return providers.terminalCommandForAgent(agentId, "/Users/h2o/Documents/AgentMuitle");
 }
 
 function runCommandForAgent(agentId, promptFile, workspacePath) {
-  const promptPath = JSON.stringify(promptFile);
-  const cwdPath = JSON.stringify(workspacePath || "/Users/h2o/Documents/CD 파이프라인 구축");
-  const commands = {
-    codex: `if command -v codex >/dev/null 2>&1; then codex exec --sandbox workspace-write --ask-for-approval never -C ${cwdPath} --add-dir ${cwdPath} - < ${promptPath}; else echo 'Codex CLI를 찾지 못했습니다.'; exit 127; fi`,
-    claude: `if command -v claude >/dev/null 2>&1; then claude -p --permission-mode acceptEdits --add-dir ${cwdPath} < ${promptPath}; else echo 'Claude Code CLI를 찾지 못했습니다.'; exit 127; fi`,
-    grok: `if command -v grok >/dev/null 2>&1; then grok -p --permission-mode acceptEdits --cwd ${cwdPath} --output-format plain < ${promptPath}; else echo 'Grok CLI를 찾지 못했습니다.'; exit 127; fi`,
-    ollama: `if command -v ollama >/dev/null 2>&1; then ollama run qwen2.5-coder:7b < ${promptPath}; else echo 'Ollama를 찾지 못했습니다.'; exit 127; fi`
-  };
-  return commands[agentId] || null;
+  const state = readState();
+  return providers.runCommandForAgent(agentId, promptFile, workspacePath || state.settings.workspacePath, {
+    model: state.settings.localRouterModel
+  });
 }
 
 function createPrompt(project, instruction) {
@@ -829,13 +999,7 @@ function safeJsonParse(text = "") {
 }
 
 function routerCommandForAgent(agentId, promptFile) {
-  const promptPath = JSON.stringify(promptFile);
-  const commands = {
-    codex: `if command -v codex >/dev/null 2>&1; then codex exec - < ${promptPath}; else echo 'Codex CLI를 찾지 못했습니다.'; exit 127; fi`,
-    claude: `if command -v claude >/dev/null 2>&1; then claude -p < ${promptPath}; else echo 'Claude Code CLI를 찾지 못했습니다.'; exit 127; fi`,
-    grok: `if command -v grok >/dev/null 2>&1; then grok -p --output-format plain < ${promptPath}; else echo 'Grok CLI를 찾지 못했습니다.'; exit 127; fi`
-  };
-  return commands[agentId] || commands.codex;
+  return providers.routerCommandForAgent(agentId, promptFile) || providers.routerCommandForAgent("codex", promptFile);
 }
 
 function runRouterCli(routerAgent, prompt) {
@@ -879,6 +1043,8 @@ async function callRouterAgent(project, text) {
     "- 조사와 설계처럼 서로 다른 성격은 분리한다.",
     "- Grok은 사용량 제한 가능성이 있으므로 필수는 아니며, 외부 조사도 Codex로 배정 가능하다.",
     "- 사용자가 직접 말하지 않은 회사명, 제품명, 도메인명, 기술명은 절대 새로 만들지 않는다.",
+    "- 범위가 넓은 코드 탐색 요청은 구현 작업과 분리해 '탐색 위임' 작업을 먼저 만든다.",
+    "- 탐색 위임 작업의 결과는 전체 로그가 아니라 did/artifacts/blocked/next 요약으로 인계한다.",
     "- 출력은 설명 없이 JSON만 반환한다.",
     "",
     "JSON 형식:",
@@ -929,18 +1095,71 @@ function normalizeRouterPlan(parsed, fallbackRuns) {
   return runs.length ? runs : fallbackRuns;
 }
 
+function validateRouterParsed(parsed) {
+  const errors = [];
+  if (!parsed || typeof parsed !== "object") errors.push("JSON 객체가 아님");
+  if (parsed && typeof parsed.shouldRun !== "boolean") errors.push("shouldRun boolean 누락");
+  if (parsed?.shouldRun && !Array.isArray(parsed.tasks)) errors.push("tasks 배열 누락");
+  if (Array.isArray(parsed?.tasks)) {
+    parsed.tasks.forEach((task, index) => {
+      if (!["codex", "claude", "grok"].includes(task.agentId)) errors.push(`tasks[${index}].agentId 오류`);
+      if (!String(task.instruction || "").trim()) errors.push(`tasks[${index}].instruction 누락`);
+    });
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+async function repairRouterResult(project, text, badRaw, errors) {
+  const state = readState();
+  const localRouterModel = project.localRouterModel || state.settings.localRouterModel || "qwen2.5-coder:7b";
+  const prompt = [
+    "아래 Router 결과는 형식 오류가 있다. 설명 없이 올바른 JSON만 다시 작성해라.",
+    "",
+    "필수 형식:",
+    '{"shouldRun":true,"reason":"한 문장","tasks":[{"agentId":"codex|claude|grok","taskName":"짧은 작업명","instruction":"구체적 지시"}]}',
+    "",
+    `오류: ${errors.join(", ")}`,
+    `사용자 요청: ${text}`,
+    "잘못된 출력:",
+    String(badRaw || "").slice(0, 2500)
+  ].join("\n");
+  const output = await callOllamaGenerate(localRouterModel, prompt, 30000);
+  recordUsageEvent(state, {
+    projectId: project.id,
+    agentId: "ollama",
+    usageType: "router_retry",
+    provider: "ollama",
+    model: localRouterModel,
+    inputTokens: estimateTokens(prompt),
+    outputTokens: estimateTokens(output),
+    isLocal: true,
+    note: "Router 결과 검증 실패 후 로컬 재시도"
+  });
+  writeState(state);
+  return safeJsonParse(output);
+}
+
 async function plannedRunsFromMessage(project, text = "") {
   const fallbackRuns = fallbackPlannedRunsFromMessage(text);
   try {
     const routed = await callRouterAgent(project, text);
-    if (!routed.parsed?.shouldRun) {
-      return { source: "router", agent: routed.agent, reason: routed.parsed?.reason || "실행 작업 없음", runs: [] };
+    let parsed = routed.parsed;
+    let validation = validateRouterParsed(parsed);
+    if (!validation.ok) {
+      parsed = await repairRouterResult(project, text, routed.raw, validation.errors);
+      validation = validateRouterParsed(parsed);
+    }
+    if (!validation.ok) {
+      throw new Error(`Router JSON 검증 실패: ${validation.errors.join(", ")}`);
+    }
+    if (!parsed?.shouldRun) {
+      return { source: "router", agent: routed.agent, reason: parsed?.reason || "실행 작업 없음", runs: [] };
     }
     return {
       source: "router",
       agent: routed.agent,
-      reason: routed.parsed?.reason || "Router AI가 작업을 분배했습니다.",
-      runs: normalizeRouterPlan(routed.parsed, fallbackRuns)
+      reason: parsed?.reason || "Router AI가 작업을 분배했습니다.",
+      runs: normalizeRouterPlan(parsed, fallbackRuns)
     };
   } catch (error) {
     return {
@@ -996,6 +1215,10 @@ function createRunRecord(state, project, agentId, instruction, taskName) {
   return { run, shellCommand };
 }
 
+function createRunRecordOnly(state, project, agentId, instruction, taskName) {
+  return createRunRecord(state, project, agentId, instruction, taskName);
+}
+
 function routePendingAutoRuns(state) {
   const autoRuns = [];
 
@@ -1026,7 +1249,13 @@ async function routeMessageToRuns(projectId, messageId) {
   if (!shouldAutoRunFromMessage(message.text || "")) return;
 
   const autoRuns = [];
-  const routing = await plannedRunsFromMessage(project, message.text || "");
+  const graph = createRoutingGraph(project, message);
+  const graphResult = await graph.run("요청분석", {
+    projectId: project.id,
+    messageId,
+    userText: message.text || ""
+  });
+  const routing = graphResult.routing || { source: "fallback", agent: null, reason: "작업 분배 결과 없음", runs: [] };
   recordCheckpoint(state, project.id, "작업분배", {
     messageId,
     routingSource: routing.source,
@@ -1049,11 +1278,18 @@ async function routeMessageToRuns(projectId, messageId) {
 
   routing.runs.forEach((plan) => {
     const created = createRunRecord(state, project, plan.agentId, plan.instruction, plan.taskName);
-    if (created.shellCommand) autoRuns.push(created.run);
+    const reason = permissionGate.approvalReason(plan.instruction);
+    if (state.settings?.requireApprovalForRiskyRuns && reason) {
+      addApprovalForRun(state, project, created.run, reason);
+    } else if (created.shellCommand) {
+      autoRuns.push(created.run);
+    }
   });
   project.autoRoutedMessageIds.push(messageId);
-  project.status = autoRuns.length ? "에이전트 실행 중" : "작업 생성 실패";
+  const pendingApproval = (project.approvals || []).some((item) => item.state === "대기");
+  project.status = autoRuns.length ? "에이전트 실행 중" : pendingApproval ? "사용자 승인 대기" : "작업 생성 실패";
   project.updatedAt = now();
+  rememberProjectEvent(state, project.id, "routing", routing.reason, ["router"]);
   writeState(state);
   autoRuns.forEach((run) => startAgentRun(run));
 }
@@ -1080,13 +1316,14 @@ function hydrateRunOutputsForUi(state) {
 }
 
 function startAgentRun(run) {
+  const requestId = uid("req");
   const shellCommand = runCommandForAgent(run.agentId, run.promptFile, run.workspacePath);
   if (!shellCommand) {
     updateRun(run.id, { state: "실패", exitCode: -1, output: "알 수 없는 에이전트입니다." });
     return;
   }
 
-  updateRun(run.id, { state: "실행 중", startedAt: now() });
+  updateRun(run.id, { state: "실행 중", startedAt: now(), requestId, partial: false });
   const startState = readState();
   recordCheckpoint(startState, run.projectId, "에이전트실행시작", {
     runId: run.id,
@@ -1104,6 +1341,7 @@ function startAgentRun(run) {
     }
   });
   runningProcesses.set(run.id, child);
+  activeRunRequests.set(run.id, requestId);
   const maxRuntimeMs = 5 * 60 * 1000;
   const timeoutTimer = setTimeout(() => {
     if (!runningProcesses.has(run.id)) return;
@@ -1111,15 +1349,27 @@ function startAgentRun(run) {
     child.kill("SIGTERM");
   }, maxRuntimeMs);
 
-  child.stdout.on("data", (data) => appendRunLog(run, data.toString()));
-  child.stderr.on("data", (data) => appendRunLog(run, data.toString()));
+  const savePartial = (chunk) => {
+    if (activeRunRequests.get(run.id) !== requestId) return;
+    appendRunLog(run, chunk);
+    const partialOutput = fs.existsSync(run.logFile) ? fs.readFileSync(run.logFile, "utf8").slice(-12000) : "";
+    updateRun(run.id, {
+      output: filterOutputForContext(partialOutput),
+      partial: true
+    });
+  };
+  child.stdout.on("data", (data) => savePartial(data.toString()));
+  child.stderr.on("data", (data) => savePartial(data.toString()));
   child.on("error", (error) => {
+    if (activeRunRequests.get(run.id) !== requestId) return;
     clearTimeout(timeoutTimer);
     appendRunLog(run, `\n[orchestrator error] ${error.message}\n`);
-    updateRun(run.id, { state: "실패", error: error.message, finishedAt: now() });
+    updateRun(run.id, { state: "실패", error: error.message, finishedAt: now(), partial: true });
     runningProcesses.delete(run.id);
+    activeRunRequests.delete(run.id);
   });
   child.on("close", (code) => {
+    if (activeRunRequests.get(run.id) !== requestId) return;
     clearTimeout(timeoutTimer);
     const rawOutput = fs.existsSync(run.logFile) ? fs.readFileSync(run.logFile, "utf8").trim() : "";
     const output = readState().settings?.enableOutputFiltering ? filterOutputForContext(rawOutput) : rawOutput;
@@ -1132,6 +1382,7 @@ function startAgentRun(run) {
       savedRun.exitCode = code;
       savedRun.rawOutputBytes = Buffer.byteLength(rawOutput, "utf8");
       savedRun.output = output.slice(-20000);
+      savedRun.partial = code !== 0 && Boolean(savedRun.partial);
       savedRun.finishedAt = now();
       savedRun.updatedAt = now();
     }
@@ -1142,6 +1393,7 @@ function startAgentRun(run) {
       exitCode: code,
       outputTokens: estimateTokens(output)
     });
+    const actualUsage = parseActualUsage(rawOutput);
     recordUsageEvent(state, {
       projectId: run.projectId,
       runId: run.id,
@@ -1149,10 +1401,12 @@ function startAgentRun(run) {
       usageType: "agent_run",
       provider: run.agentId,
       model: run.agentId,
-      inputTokens: estimateTokens(promptText),
-      outputTokens: estimateTokens(output),
+      inputTokens: actualUsage?.inputTokens ?? estimateTokens(promptText),
+      outputTokens: actualUsage?.outputTokens ?? estimateTokens(output),
       isLocal: run.agentId === "ollama",
-      note: rawOutput.length !== output.length ? `출력 필터링 적용: ${rawOutput.length}자 → ${output.length}자` : "실행 결과 저장"
+      note: actualUsage
+        ? `실제 usage 파싱: ${actualUsage.source}`
+        : rawOutput.length !== output.length ? `출력 필터링 적용: ${rawOutput.length}자 → ${output.length}자` : "실행 결과 저장"
     });
     if (project) {
       appendProjectMessage(state, project, {
@@ -1160,6 +1414,7 @@ function startAgentRun(run) {
         author: agentLabelsForMain(run.agentId),
         text: output ? output.slice(-6000) : `${run.agentId} 실행이 종료되었습니다. exitCode=${code}`
       });
+      rememberProjectEvent(state, project.id, "agent_result", output || `${run.agentId} exitCode=${code}`, [run.agentId, "result"]);
       const hasOtherRunning = state.runs.some((item) => item.projectId === project.id && item.id !== run.id && ["실행 중", "대기"].includes(item.state));
       const hasAnyFailure = state.runs.some((item) => item.projectId === project.id && item.id !== run.id && item.state === "실패");
       project.status = hasOtherRunning ? "에이전트 실행 중" : code === 0 && !hasAnyFailure ? "에이전트 결과 도착" : "에이전트 일부 실패";
@@ -1173,16 +1428,12 @@ function startAgentRun(run) {
     }
     writeState(state);
     runningProcesses.delete(run.id);
+    activeRunRequests.delete(run.id);
   });
 }
 
 function agentLabelsForMain(agentId) {
-  return {
-    codex: "Codex",
-    claude: "Claude Code",
-    grok: "Grok",
-    ollama: "Local LLM"
-  }[agentId] || agentId;
+  return providers.agentLabel(agentId);
 }
 
 function upsertEval(project, item) {
@@ -1267,6 +1518,7 @@ ipcMain.handle("add-message", async (_event, projectId, text) => {
     createdAt: now()
   };
   project.messages.push(message);
+  rememberProjectEvent(state, project.id, "user_message", cleanText, ["conversation"]);
   recordCheckpoint(state, project.id, "사용자요청접수", {
     messageId: message.id,
     text: compactText(cleanText, 1200),
@@ -1318,9 +1570,28 @@ ipcMain.handle("update-approval", async (_event, projectId, approvalId, action) 
   const state = readState();
   const project = findProject(state, projectId);
   const approval = project.approvals.find((item) => item.id === approvalId);
+  let runToStart = null;
   if (approval) {
     approval.state = action === "approve" ? "승인" : action === "reject" ? "거절" : "수정 요청";
     approval.updatedAt = now();
+    if (approval.state === "승인" && approval.runId) {
+      const run = state.runs.find((item) => item.id === approval.runId);
+      if (run && run.state === "승인 대기") {
+        run.state = "대기";
+        const task = project.tasks.find((item) => item.runId === run.id);
+        if (task) task.state = "진행 중";
+        runToStart = run;
+      }
+    }
+    if (["거절", "수정 요청"].includes(approval.state) && approval.runId) {
+      const run = state.runs.find((item) => item.id === approval.runId);
+      if (run && run.state === "승인 대기") {
+        run.state = approval.state === "거절" ? "거절" : "수정 요청";
+        run.finishedAt = now();
+        const task = project.tasks.find((item) => item.runId === run.id);
+        if (task) task.state = run.state;
+      }
+    }
   }
   project.messages.push({
     id: uid("msg"),
@@ -1329,9 +1600,11 @@ ipcMain.handle("update-approval", async (_event, projectId, approvalId, action) 
     text: `승인 상태가 '${approval?.state || action}'로 변경되었습니다.`,
     createdAt: now()
   });
+  project.status = runToStart ? "에이전트 실행 중" : project.status;
   project.updatedAt = now();
   writeState(state);
-  return state;
+  if (runToStart) startAgentRun(runToStart);
+  return readState();
 });
 
 ipcMain.handle("check-agents", async () => {
@@ -1352,49 +1625,21 @@ ipcMain.handle("check-agents", async () => {
 ipcMain.handle("run-agent-task", async (_event, projectId, agentId, instruction) => {
   const state = readState();
   const project = findProject(state, projectId);
-  const runId = uid("run");
-  const runDir = path.join(DATA_DIR, "runs", runId);
-  fs.mkdirSync(runDir, { recursive: true });
-  const promptFile = path.join(runDir, "prompt.md");
-  const logFile = path.join(runDir, "run.log");
-  const prompt = createPrompt(project, instruction);
-  fs.writeFileSync(promptFile, prompt, "utf8");
-  fs.writeFileSync(logFile, "", "utf8");
-
-  const shellCommand = runCommandForAgent(agentId, promptFile, project.workspacePath || state.settings.workspacePath);
-  const run = {
-    id: runId,
-    projectId: project.id,
-    agentId,
-    instruction,
-    promptFile,
-    logFile,
-    workspacePath: project.workspacePath || state.settings.workspacePath,
-    state: shellCommand ? "대기" : "실패",
-    createdAt: now()
-  };
-  state.runs.unshift(run);
-  project.tasks.push({
-    id: uid("task"),
-    runId,
-    state: shellCommand ? "진행 중" : "실패",
-    name: `${agentId} 실행 요청`,
-    detail: instruction || "현재 프로젝트 검토",
-    createdAt: now()
-  });
-  project.messages.push({
-    id: uid("msg"),
-    role: "assistant",
-    author: "Orchestrator",
-    text: shellCommand
-      ? `${agentId}에게 작업을 전달했습니다. 결과는 실행 로그와 대화창에 자동으로 회수됩니다.`
-      : `${agentId} 실행 명령을 만들지 못했습니다.`,
-    createdAt: now()
-  });
+  const { run, shellCommand } = createRunRecordOnly(state, project, agentId, instruction, `${agentLabelsForMain(agentId)} 실행 요청`);
+  const reason = permissionGate.approvalReason(instruction);
+  if (state.settings?.requireApprovalForRiskyRuns && reason) {
+    addApprovalForRun(state, project, run, reason);
+    appendProjectMessage(state, project, {
+      role: "assistant",
+      author: "Permission Gate",
+      text: `${agentLabelsForMain(agentId)} 작업은 승인 후 실행됩니다.\n${reason}`
+    });
+  }
   project.updatedAt = now();
   writeState(state);
 
   if (!shellCommand) return { ok: false, state, run };
+  if (run.state === "승인 대기") return { ok: true, state: readState(), run };
   startAgentRun(run);
   return { ok: true, state: readState(), run };
 });
@@ -1452,9 +1697,20 @@ ipcMain.handle("run-multi-agent-task", async (_event, projectId, agentIds, instr
       author: "Orchestrator",
       text: `${agentLabelsForMain(agentId)} 병렬 실행을 시작했습니다.`
     });
-    project.status = "멀티 에이전트 실행 중";
+    const reason = permissionGate.approvalReason(instruction);
+    if (state.settings?.requireApprovalForRiskyRuns && reason) {
+      addApprovalForRun(state, project, run, reason);
+      appendProjectMessage(state, project, {
+        role: "assistant",
+        author: "Permission Gate",
+        text: `${agentLabelsForMain(agentId)} 병렬 작업은 승인 후 실행됩니다.\n${reason}`
+      });
+      project.status = "사용자 승인 대기";
+    } else {
+      project.status = "멀티 에이전트 실행 중";
+    }
     writeState(state);
-    if (shellCommand) startAgentRun(run);
+    if (shellCommand && run.state !== "승인 대기") startAgentRun(run);
     created.push(run);
   }
   return { ok: true, state: readState(), runs: created };
@@ -1466,7 +1722,25 @@ ipcMain.handle("stop-run", async (_event, runId) => {
     child.kill("SIGTERM");
     runningProcesses.delete(runId);
   }
-  const run = updateRun(runId, { state: "중단", finishedAt: now() });
+  activeRunRequests.delete(runId);
+  const state = readState();
+  const savedRun = state.runs.find((item) => item.id === runId);
+  if (savedRun?.logFile && fs.existsSync(savedRun.logFile)) {
+    savedRun.output = filterOutputForContext(fs.readFileSync(savedRun.logFile, "utf8"));
+  }
+  if (savedRun) {
+    savedRun.state = "중단";
+    savedRun.partial = true;
+    savedRun.finishedAt = now();
+    savedRun.updatedAt = now();
+    recordCheckpoint(state, savedRun.projectId, "에이전트실행중단", {
+      runId,
+      partial: true,
+      outputTokens: estimateTokens(savedRun.output || "")
+    });
+  }
+  writeState(state);
+  const run = savedRun || null;
   return { ok: Boolean(run), state: readState(), run };
 });
 
@@ -1566,6 +1840,18 @@ ipcMain.handle("search-state", async (_event, query) => {
       if (haystack.includes(needle)) {
         items.push({ type: "task", projectId: project.id, projectTitle: project.title, text: `${task.name}: ${task.detail}`, createdAt: task.createdAt });
       }
+    }
+  }
+  for (const memory of state.memories || []) {
+    if (String(memory.text || "").toLowerCase().includes(needle)) {
+      const project = state.projects.find((item) => item.id === memory.projectId);
+      items.push({
+        type: "memory",
+        projectId: memory.projectId,
+        projectTitle: project?.title || "전체 메모리",
+        text: memory.text,
+        createdAt: memory.createdAt
+      });
     }
   }
   return { ok: true, items: items.slice(0, 50) };
