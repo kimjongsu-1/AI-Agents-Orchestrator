@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI 오케스트레이터</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="sidebar-title">
+          <strong>AI 오케스트레이터</strong>
+          <button id="new-project" title="새 대화 / 프로젝트 만들기">+</button>
+        </div>
+
+        <nav id="project-list" class="project-list" aria-label="프로젝트 목록"></nav>
+
+        <section class="agent-status-panel" aria-label="에이전트 로그인 상태">
+          <p>
+            <span>Agents</span>
+            <button id="refresh-agents" class="agent-refresh" type="button" title="상태 새로고침">↻</button>
+          </p>
+          <button class="agent-login-button" data-agent-login="codex">
+            <span class="login-dot green"></span>
+            <span>Codex</span>
+            <small>로그인됨</small>
+          </button>
+          <button class="agent-login-button" data-agent-login="claude">
+            <span class="login-dot red"></span>
+            <span>Claude</span>
+            <small>로그인 필요</small>
+          </button>
+          <button class="agent-login-button" data-agent-login="grok">
+            <span class="login-dot red"></span>
+            <span>Grok</span>
+            <small>로그인 필요</small>
+          </button>
+          <button class="agent-login-button" data-agent-login="ollama">
+            <span class="login-dot red"></span>
+            <span>Local LLM</span>
+            <small>Ollama 확인 필요</small>
+          </button>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="chat-header">
+          <div>
+            <p id="project-status">UI 구현 중</p>
+            <h1 id="project-title">멀티 AI 오케스트레이터 UI</h1>
+          </div>
+          <div class="header-actions">
+            <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="false">
+              <span>Dark</span>
+              <i></i>
+            </button>
+            <button id="open-control" class="control-trigger">Control Center</button>
+          </div>
+        </header>
+
+        <section class="tabs">
+          <button class="tab active" data-view="conversation">대화</button>
+          <button class="tab" data-view="tasks">작업</button>
+          <button class="tab" data-view="evals">Evals</button>
+          <button class="tab" data-view="runs">실행 로그</button>
+          <button class="tab" data-view="usage">사용량</button>
+          <button class="tab" data-view="compare">비교/병합</button>
+          <button class="tab" data-view="settings">설정</button>
+        </section>
+
+        <section id="conversation-view" class="view conversation-view"></section>
+
+        <section id="tasks-view" class="view tasks-view hidden"></section>
+
+        <section id="evals-view" class="view evals-view hidden"></section>
+        <section id="runs-view" class="view runs-view hidden"></section>
+        <section id="usage-view" class="view usage-view hidden"></section>
+        <section id="compare-view" class="view compare-view hidden"></section>
+        <section id="settings-view" class="view settings-view hidden"></section>
+
+        <section class="agent-runner">
+          <select id="agent-select" aria-label="에이전트 선택">
+            <option value="codex">Codex</option>
+            <option value="claude">Claude</option>
+            <option value="grok">Grok</option>
+            <option value="ollama">Local LLM</option>
+          </select>
+          <input id="agent-instruction" type="text" placeholder="선택한 에이전트에게 실행할 작업 지시" />
+          <button id="run-agent" type="button">에이전트 실행</button>
+          <button id="run-multi-agent" type="button">멀티 실행</button>
+          <button id="open-data-folder" type="button">저장소 열기</button>
+        </section>
+
+        <form class="composer">
+          <textarea placeholder="메시지를 입력하세요."></textarea>
+          <button type="submit">전송</button>
+        </form>
+      </main>
+    </div>
+
+    <div id="control-window" class="control-window hidden" role="dialog" aria-modal="false" aria-label="Control Center">
+      <div class="control-titlebar">
+        <strong>Control Center</strong>
+        <button id="close-control" title="닫기">×</button>
+      </div>
+      <section>
+        <h2>현재 작업</h2>
+        <dl id="control-current-task"></dl>
+      </section>
+      <section>
+        <h2>승인 대기</h2>
+        <div id="control-approvals"></div>
+      </section>
+      <section>
+        <h2>Evals</h2>
+        <dl id="control-evals"></dl>
+      </section>
+      <section>
+        <h2>작업 제어</h2>
+        <div class="control-actions">
+          <button>Stop</button>
+          <button>Retry</button>
+          <button>Reassign</button>
+          <button>Pause after step</button>
+        </div>
+      </section>
+      <section>
+        <h2>Agents</h2>
+        <div id="control-agents"></div>
+      </section>
+    </div>
+
+    <div id="new-project-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
+      <form class="modal-card" id="new-project-form">
+        <div class="modal-header">
+          <div>
+            <p>New Project</p>
+            <h2 id="new-project-title">새 대화 / 프로젝트 만들기</h2>
+          </div>
+          <button type="button" id="close-new-project-modal" class="modal-close" title="닫기">×</button>
+        </div>
+        <label class="modal-field">
+          <span>프로젝트명</span>
+          <input id="new-project-title-input" type="text" placeholder="예: CX 챗봇 개선 검토" autocomplete="off" />
+        </label>
+        <div class="modal-actions">
+          <button type="button" id="cancel-new-project">취소</button>
+          <button type="submit" class="primary">프로젝트 생성</button>
+        </div>
+      </form>
+    </div>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>

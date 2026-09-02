@@ -1,0 +1,15 @@
+{
+  "name": "ai-agents-orchestrator",
+  "productName": "AI 오케스트레이터",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop UI prototype for a human-in-the-loop multi-AI orchestrator.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "start:direct": "./node_modules/.bin/electron ."
+  },
+  "devDependencies": {
+    "electron": "^38.1.2"
+  }
+}
