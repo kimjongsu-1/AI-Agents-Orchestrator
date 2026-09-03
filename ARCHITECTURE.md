@@ -153,16 +153,14 @@ LangGraph는 사용자가 직접 보는 기능명이 아니라 내부 실행 흐
 
 - `src/engine/langgraph_runtime.js`
 
-## 리팩터링 우선순위
+## 현재 분리 완료 상태
 
-현재 `src/main.js`에는 기능이 많이 모여 있습니다. 다음 순서로 점진 분리합니다.
+`src/main.js`는 Electron 생명주기와 서비스 조립만 담당하도록 축소했습니다. 실제 기능은 아래 모듈로 이동했습니다.
 
-1. Provider Adapter 유지 및 고도화
-2. Router 프롬프트/검증/재시도 로직 분리
-3. Runner 실행/스트림/취소/partial 저장 분리
-4. Storage JSON/SQLite 동기화 분리
-5. Usage Tracking 저장소 분리
-6. MCP Bridge와 Permission Gate 연결
-7. Renderer 컴포넌트 분리
+| 단계 | 분리 결과 |
+|---|---|
+| 1차 | `app`, `storage`, `providers`, `router`, `runners`로 메인 프로세스 핵심 책임 분리 |
+| 2차 | `usage`, `memory`, `automation`, `mcp`를 독립 서비스로 분리 |
+| 3차 | Renderer 공통 표시 함수와 에이전트 라벨을 `renderer/modules`로 분리 |
 
-이 순서가 안전한 이유는, 화면을 크게 바꾸지 않고도 내부 책임을 하나씩 분리할 수 있기 때문입니다.
+현재 구조의 기준은 “Electron 진입점은 얇게, 실행 정책은 서비스에, Provider 차이는 Adapter에”입니다. 이후 UI가 커지면 `renderer/components` 아래로 프로젝트 목록, 대화창, 실행 로그, 사용량 패널을 추가 분리하면 됩니다.
