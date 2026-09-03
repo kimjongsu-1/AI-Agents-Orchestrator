@@ -1,5 +1,6 @@
 import { agentLabels } from "./modules/agent_labels.js";
 import { escapeHtml, renderRichText, formatTime, formatKrw, sumUsage } from "./modules/formatters.js";
+import { renderProjectList } from "./components/project_list.js";
 
 let appState = null;
 let selectedProjectId = null;
@@ -72,17 +73,7 @@ function getSelectedProject() {
 }
 
 function renderProjects() {
-  els.projectList.innerHTML = (appState.projects || [])
-    .map((project) => {
-      const active = project.id === selectedProjectId ? " active" : "";
-      return `
-        <button class="project${active}" data-project-id="${escapeHtml(project.id)}">
-          <span>${escapeHtml(project.title)}</span>
-          <small>${escapeHtml(project.status || "대기")} · ${formatTime(project.updatedAt)}</small>
-        </button>
-      `;
-    })
-    .join("");
+  els.projectList.innerHTML = renderProjectList(appState.projects || [], selectedProjectId);
 }
 
 function renderConversation(project) {
