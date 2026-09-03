@@ -33,6 +33,19 @@ Provider Adapter
 프로젝트별 대화 이어하기
 ```
 
+## 아키텍처
+
+이 프로젝트는 **모듈형 레이어드 아키텍처 + Provider Adapter 패턴**을 기준으로 확장합니다.
+
+- Provider Adapter: Codex / Claude / Grok / Ollama 실행 방식 통일
+- Router Layer: 사용자 요청을 작업 단위로 분배
+- Runner Layer: 실행, 스트림, 취소, partial 저장, 결과 회수
+- Storage Layer: JSON 저장 + SQLite 동기화
+- MCP Layer: 외부 CLI/에이전트가 오케스트레이터 상태를 읽는 Bridge
+- Usage Layer: 모델별 토큰과 로컬 LLM 절감량 추적
+
+자세한 구조는 [ARCHITECTURE.md](./ARCHITECTURE.md)를 참고합니다.
+
 ## 적용한 설계
 
 ### 1. Inference Router
