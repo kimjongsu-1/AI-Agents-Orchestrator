@@ -10,12 +10,13 @@ const { recordCheckpoint } = require("../memory/memory_service");
 const { buildContextProjection } = require("./context_projection");
 
 function shouldAutoRunFromMessage(text = "") {
-  return /(진행해|시작해|실행해|조사|설계|구현|테스트|개발)/.test(text);
+  return Boolean(String(text || "").trim());
 }
 
 function fallbackPlannedRunsFromMessage(text = "") {
   const normalized = text.replace(/\s+/g, " ").trim();
   const runs = [];
+  const looksLikeWorkerTask = /(진행|시작|실행|조사|설계|구현|테스트|개발|만들|수정|고쳐|찾아|분석|검토|정리|커밋|푸시)/.test(normalized);
 
   if (/타사|경쟁|유사|시장|조사/.test(normalized)) {
     runs.push({
@@ -57,7 +58,7 @@ function fallbackPlannedRunsFromMessage(text = "") {
     });
   }
 
-  if (!runs.length) {
+  if (!runs.length && looksLikeWorkerTask) {
     runs.push({
       agentId: "codex",
       taskName: "요청 분석 및 작업 계획 수립",
@@ -163,14 +164,15 @@ function createRouterService({ readState, writeState, dataDir, agentLabel }) {
       "분배 원칙:",
       "- 사용자가 명시한 단계가 있으면 그 순서를 유지한다.",
       "- 하나의 큰 요청은 1~4개의 작업으로 나눈다.",
-      "- 구현 요청이 없으면 구현 작업은 만들지 않는다.",
+      "- 구현/조사/설계/테스트처럼 실제 작업이 필요한 요청이면 shouldRun=true로 작업을 만든다.",
+      "- 단순 질문, 상태 확인, 사용법 질문, 잡담처럼 바로 답할 수 있는 요청이면 shouldRun=false로 두고 response에 자연스럽게 답한다.",
       "- 조사와 설계처럼 서로 다른 성격은 분리한다.",
       "- 범위가 넓은 코드 탐색 요청은 구현 작업과 분리해 '탐색 위임' 작업을 먼저 만든다.",
       "- 사용자가 직접 말하지 않은 회사명, 제품명, 도메인명, 기술명은 절대 새로 만들지 않는다.",
       "- 출력은 설명 없이 JSON만 반환한다.",
       "",
       "JSON 형식:",
-      '{"shouldRun":true,"reason":"분배 판단 이유 한 문장","tasks":[{"agentId":"codex|claude|grok","taskName":"짧은 작업명","instruction":"에이전트에게 전달할 구체적 지시"}]}',
+      '{"shouldRun":true,"reason":"분배 판단 이유 한 문장","response":"바로 답변 가능한 경우의 대화형 답변","tasks":[{"agentId":"codex|claude|grok","taskName":"짧은 작업명","instruction":"에이전트에게 전달할 구체적 지시"}]}',
       "",
       "프로젝트 상태 투영:",
       JSON.stringify(projection, null, 2)
@@ -266,7 +268,13 @@ function createRouterService({ readState, writeState, dataDir, agentLabel }) {
       }
       if (!validation.ok) throw new Error(`Router JSON 검증 실패: ${validation.errors.join(", ")}`);
       if (!parsed?.shouldRun) {
-        return { source: "router", agent: routed.agent, reason: parsed?.reason || "실행 작업 없음", runs: [] };
+        return {
+          source: "router",
+          agent: routed.agent,
+          reason: parsed?.reason || "실행 작업 없음",
+          response: parsed?.response || parsed?.reason || "바로 실행할 작업은 없다고 판단했습니다.",
+          runs: []
+        };
       }
       return {
         source: "router",
@@ -279,6 +287,9 @@ function createRouterService({ readState, writeState, dataDir, agentLabel }) {
         source: "fallback",
         agent: null,
         reason: `Router AI 사용 불가: ${error.message}. 규칙 기반으로 임시 분배했습니다.`,
+        response: fallbackRuns.length
+          ? ""
+          : `Router AI가 응답하지 않아 작업을 자동 분배하지 않았습니다.\n\n오류: ${error.message}\n\n실행이 필요한 요청이면 '구현해', '조사해', '실행해'처럼 작업 의도를 포함해서 다시 입력해 주세요.`,
         runs: fallbackRuns
       };
     }

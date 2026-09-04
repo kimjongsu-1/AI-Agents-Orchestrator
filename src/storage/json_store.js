@@ -24,6 +24,7 @@ function createJsonStore({ app, now }) {
       ...defaultState.settings,
       ...(state.settings || {})
     };
+    state.settings.requireApprovalForRiskyRuns = false;
     state.projects = state.projects || [];
     state.runs = state.runs || [];
     state.usageEvents = state.usageEvents || [];

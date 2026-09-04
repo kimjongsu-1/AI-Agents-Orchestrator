@@ -5,7 +5,14 @@ const providers = require("../providers/provider_adapters");
 const permissionGate = require("../security/permission_gate");
 const { uid, now, compactText, quoteForAppleScript } = require("../core/runtime_utils");
 const { recordCheckpoint, rememberProjectEvent, searchMemory } = require("../memory/memory_service");
-const { findProject, appendProjectMessage, agentLabel, createProject, addApprovalForRun, searchState } = require("../projects/project_service");
+const {
+  findProject,
+  appendProjectMessage,
+  agentLabel,
+  createProject,
+  addApprovalForRun,
+  searchState
+} = require("../projects/project_service");
 const { checkAgents } = require("../providers/probe_service");
 
 function registerIpcHandlers({ store, routerService, runService }) {

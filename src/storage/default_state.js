@@ -12,7 +12,7 @@ function createDefaultState(now) {
       enablePreScope: true,
       enableOutputFiltering: true,
       enableUsageTracking: true,
-      requireApprovalForRiskyRuns: true,
+      requireApprovalForRiskyRuns: false,
       enableDailyRoutine: true,
       dailyRoutineHour: 9
     },

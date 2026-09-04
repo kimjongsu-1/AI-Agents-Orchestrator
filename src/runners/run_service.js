@@ -80,23 +80,10 @@ function createRunService({ readState, writeState, dataDir, routerService }) {
   }
 
   function routePendingAutoRuns(state) {
-    const autoRuns = [];
-    state.projects.forEach((project) => {
-      (project.messages || [])
-        .filter((message) => message.role === "user" && !project.autoRoutedMessageIds.includes(message.id))
-        .filter((message) => routerService.shouldAutoRunFromMessage(message.text || ""))
-        .slice(-1)
-        .forEach((message) => {
-          routerService.fallbackPlannedRunsFromMessage(message.text || "").forEach((plan) => {
-            const created = createRunRecord(state, project, plan.agentId, plan.instruction, plan.taskName);
-            if (created.shellCommand) autoRuns.push(created.run);
-          });
-          project.autoRoutedMessageIds.push(message.id);
-          project.status = autoRuns.length ? "에이전트 실행 중" : "작업 생성 실패";
-          project.updatedAt = now();
-        });
-    });
-    return autoRuns;
+    // 대화형 모드에서는 모든 새 메시지가 Router 판단 대상이다.
+    // 따라서 앱 로드 시 과거 미처리 메시지를 훑어 자동 실행하면 예전 대화가 갑자기 실행될 수 있다.
+    // 재시작 복구는 명시적인 실행 중 run 처리로 확장하고, 여기서는 새 입력 흐름만 사용한다.
+    return [];
   }
 
   async function routeMessageToRuns(projectId, messageId) {
@@ -134,6 +121,12 @@ function createRunService({ readState, writeState, dataDir, routerService }) {
           ...routing.runs.map((run, index) => `${index + 1}. ${agentLabel(run.agentId)} → ${run.taskName}`)
         ].join("\n")
       });
+    } else {
+      appendProjectMessage(state, project, {
+        role: "assistant",
+        author: routing.source === "router" ? `Router AI (${agentLabel(routing.agent)})` : "Router Fallback",
+        text: routing.response || routing.reason || "바로 실행할 작업은 없습니다."
+      });
     }
 
     const autoRuns = [];
@@ -144,8 +137,7 @@ function createRunService({ readState, writeState, dataDir, routerService }) {
       else if (created.shellCommand) autoRuns.push(created.run);
     });
     project.autoRoutedMessageIds.push(messageId);
-    const pendingApproval = (project.approvals || []).some((item) => item.state === "대기");
-    project.status = autoRuns.length ? "에이전트 실행 중" : pendingApproval ? "사용자 승인 대기" : "작업 생성 실패";
+    project.status = autoRuns.length ? "에이전트 실행 중" : "Router 응답 완료";
     project.updatedAt = now();
     rememberProjectEvent(state, project.id, "routing", routing.reason, ["router"]);
     writeState(state);
